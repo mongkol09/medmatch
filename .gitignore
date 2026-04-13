@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Logs
+*.log
+/tmp/
+
+# Credentials / secrets — never commit
+**/.env
+**/.env.local
+**/.env.production
+**/.env.staging
+
+# Keep templates
+!**/.env.example
+!**/.env.railway
+
+# Node
+**/node_modules/
+
+# Build outputs
+**/dist/
+
+# Prisma generated
+**/generated/prisma/
+
+# Uploaded files (use object storage in production)
+medmatch-api/uploads/
+
+# Editor
+.vscode/settings.json
+*.swp

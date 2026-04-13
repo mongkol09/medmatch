@@ -1,0 +1,73 @@
+# ==========================================
+# MedMatch API — Docker Compose
+# ==========================================
+
+version: '3.8'
+
+services:
+  # --- PostgreSQL + PostGIS ---
+  postgres:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: medmatch-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: medmatch
+      POSTGRES_USER: medmatch
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme_secure_password}
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - medmatch-network
+
+  # --- Redis ---
+  redis:
+    image: redis:7-alpine
+    container_name: medmatch-redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-changeme_redis}
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    networks:
+      - medmatch-network
+
+  # --- NestJS API ---
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medmatch-api
+    restart: unless-stopped
+    ports:
+      - '${APP_PORT:-3000}:3000'
+    environment:
+      DATABASE_URL: postgresql://medmatch:${DB_PASSWORD:-changeme_secure_password}@postgres:5432/medmatch?schema=public&sslmode=prefer
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme_redis}@redis:6379
+      JWT_SECRET: ${JWT_SECRET}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      ENCRYPTION_KEY_VERSION: ${ENCRYPTION_KEY_VERSION:-1}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID}
+      FIREBASE_PRIVATE_KEY: ${FIREBASE_PRIVATE_KEY}
+      FIREBASE_CLIENT_EMAIL: ${FIREBASE_CLIENT_EMAIL}
+      MAPBOX_ACCESS_TOKEN: ${MAPBOX_ACCESS_TOKEN}
+      GOOGLE_PLACES_API_KEY: ${GOOGLE_PLACES_API_KEY}
+      APP_PORT: 3000
+      APP_ENV: ${APP_ENV:-production}
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - medmatch-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  medmatch-network:
+    driver: bridge

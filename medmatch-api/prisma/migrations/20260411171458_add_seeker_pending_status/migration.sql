@@ -1,0 +1,2 @@
+-- AlterEnum
+ALTER TYPE "MatchStatus" ADD VALUE 'SEEKER_PENDING';

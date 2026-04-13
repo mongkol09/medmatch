@@ -1,0 +1,599 @@
+// MedMatch — Prisma Schema
+// Bank-grade security: sensitive fields stored as encrypted Bytes
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum UserRole {
+  SEEKER
+  CLINIC
+  PATIENT
+  ADMIN
+}
+
+enum LicenseType {
+  DENTIST
+  DOCTOR
+  PHARMACIST
+  NURSE
+  DENTAL_ASSISTANT
+  PHYSIOTHERAPIST
+  OTHER
+}
+
+enum JobStatus {
+  OPEN
+  FILLED
+  EXPIRED
+  CANCELLED
+}
+
+enum ApplicationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  CANCELLED
+}
+
+enum MatchStatus {
+  SEEKER_PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum PaymentMethod {
+  TRANSFER
+  CASH
+  PROMPTPAY
+}
+
+enum PaymentStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum PaymentMatchStatus {
+  MATCHED
+  AMOUNT_MISMATCH
+  PENDING_REVIEW
+}
+
+enum VerifiedBy {
+  AI
+  MANUAL
+  ADMIN
+}
+
+enum PaymentBookingStatus {
+  UNPAID
+  DEPOSIT_PAID
+  FULLY_PAID
+}
+
+// ==========================================
+// USERS & AUTH
+// ==========================================
+
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+  phone_enc     Bytes?    // AES-256-GCM encrypted (optional if email provided)
+  phone_hash    String?   @unique // SHA-256 for lookups
+  email_enc     Bytes?    // AES-256-GCM encrypted
+  email_hash    String?   @unique
+  password_hash String    // bcrypt (saltRounds=12)
+  role          UserRole  @default(PATIENT)
+  is_active     Boolean   @default(true)
+  is_verified   Boolean   @default(true)  // false for new registrations until OTP verified
+  fcm_token     String?   // Firebase Cloud Messaging push token
+  firebase_uid  String?   @unique
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  seeker_profile  SeekerProfile?
+  clinic_profile  ClinicProfile?
+  patient_profile Patient?
+  sent_messages   Message[]       @relation("sender")
+  reviews_given   Review[]        @relation("reviewer")
+  reviews_received Review[]       @relation("reviewee")
+  notifications   Notification[]
+  audit_logs      AuditLog[]
+  consents        Consent[]
+  refresh_tokens  RefreshToken[]
+  otp_code        OtpCode?
+
+  @@index([role])
+  @@index([is_active])
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid()) @db.Uuid
+  user_id     String   @db.Uuid
+  token_hash  String   @unique
+  expires_at  DateTime
+  revoked     Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([token_hash])
+}
+
+// ==========================================
+// SEEKER / PROVIDER PROFILE
+// ==========================================
+
+model SeekerProfile {
+  id                  String      @id @default(uuid()) @db.Uuid
+  user_id             String      @unique @db.Uuid
+  first_name          String
+  last_name           String
+  license_number_enc  Bytes       // AES-256-GCM encrypted
+  license_number_hash String      // SHA-256 for uniqueness check
+  license_type        LicenseType
+  license_verified         Boolean     @default(false)
+  license_image_url        String?     // URL of submitted license document
+  license_rejection_reason String?     // set by admin on rejection
+  experience_years         Int         @default(0)
+  specialties         Json        @default("[]") // ["endo", "ortho", "prosth"]
+  sub_specialties         Json        @default("[]") // ["ORTHODONTICS", "ENDODONTICS"]
+  profile_image_url   String?
+  bio                 String?
+  phone               String?     // contact phone (visible to matched clinics)
+  line_id             String?     // LINE messenger ID
+  rating_avg          Float       @default(0)
+  rating_count        Int         @default(0)
+  created_at          DateTime    @default(now())
+  updated_at          DateTime    @updatedAt
+
+  user              User                  @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  applications      Application[]
+  matches           Match[]
+  work_history      WorkHistory[]
+  certificates      ProviderCertificate[]
+  booking_provider  Booking[]             @relation("provider")
+  schedules         ClinicSchedule[]
+
+  @@index([license_type])
+  @@index([license_verified])
+  @@index([rating_avg])
+}
+
+// ==========================================
+// CLINIC PROFILE
+// ==========================================
+
+model ClinicProfile {
+  id                String   @id @default(uuid()) @db.Uuid
+  user_id           String   @unique @db.Uuid
+  clinic_name       String
+  address           String
+  latitude          Float
+  longitude         Float
+  license_number    String?
+  license_verified  Boolean  @default(false)
+  images            Json     @default("[]") // array of image URLs
+  description       String?
+  equipment_info    String?
+  parking_info      String?
+  benefits          String?
+  phone_enc         Bytes?   // AES-256-GCM encrypted
+  chair_count       Int?     // number of dental chairs
+  consultation_fee  Float?   // walk-in consultation fee
+  bank_name         String?  // for payment info
+  bank_account      String?  // bank account number
+  line_oa           String?  // LINE Official Account ID
+  rating_avg        Float    @default(0)
+  rating_count      Int      @default(0)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  user              User             @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  jobs              Job[]
+  matches           Match[]
+  clinic_services   ClinicService[]
+  schedules         ClinicSchedule[]
+  bookings          Booking[]        @relation("clinic")
+  payments          Payment[]        @relation("paymentClinic")
+  accounting        AccountingSummary[]
+  work_history      WorkHistory[]
+  favorite_by       FavoriteClinic[]
+
+  // PostGIS: add index via raw SQL migration
+  @@index([latitude, longitude])
+  @@index([rating_avg])
+}
+
+// ==========================================
+// PATIENT PROFILE
+// ==========================================
+
+model Patient {
+  id                  String   @id @default(uuid()) @db.Uuid
+  user_id             String   @unique @db.Uuid
+  first_name_enc      Bytes    // AES-256-GCM encrypted
+  last_name_enc       Bytes    // AES-256-GCM encrypted
+  phone_enc           Bytes?   // AES-256-GCM encrypted
+  dob_enc             Bytes?   // AES-256-GCM encrypted
+  allergies_enc       Bytes?   // AES-256-GCM encrypted (medical data)
+  medical_notes_enc   Bytes?   // AES-256-GCM encrypted (medical data)
+  profile_image_url   String?
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  user     User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  bookings Booking[] @relation("patient")
+  payments Payment[] @relation("paymentPatient")
+}
+
+// ==========================================
+// JOB MATCHING
+// ==========================================
+
+model Job {
+  id                 String    @id @default(uuid()) @db.Uuid
+  clinic_id          String    @db.Uuid
+  title              String
+  description        String?
+  specialty_required LicenseType
+  sub_specialties_required Json       @default("[]") // sub-specialty tags for filtering
+  work_date          DateTime  @db.Date
+  start_time         String    // "09:00"
+  end_time           String    // "17:00"
+  pay_amount         Float?
+  pay_negotiable     Boolean   @default(false)
+  latitude           Float
+  longitude          Float
+  slots              Int       @default(1)
+  filled_slots       Int       @default(0)
+  status             JobStatus @default(OPEN)
+  expires_at         DateTime?
+  created_at         DateTime  @default(now())
+  updated_at         DateTime  @updatedAt
+
+  clinic       ClinicProfile @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+  applications Application[]
+  matches      Match[]
+
+  @@index([status])
+  @@index([work_date])
+  @@index([specialty_required])
+  @@index([latitude, longitude])
+  @@index([created_at])
+}
+
+model Application {
+  id         String            @id @default(uuid()) @db.Uuid
+  job_id     String            @db.Uuid
+  seeker_id  String            @db.Uuid
+  status     ApplicationStatus @default(PENDING)
+  created_at DateTime          @default(now())
+  updated_at DateTime          @updatedAt
+
+  job    Job           @relation(fields: [job_id], references: [id], onDelete: Cascade)
+  seeker SeekerProfile @relation(fields: [seeker_id], references: [id], onDelete: Cascade)
+
+  @@unique([job_id, seeker_id])
+  @@index([status])
+}
+
+model Match {
+  id               String      @id @default(uuid()) @db.Uuid
+  job_id           String      @db.Uuid
+  seeker_id        String      @db.Uuid
+  clinic_id        String      @db.Uuid
+  status           MatchStatus @default(CONFIRMED)
+  final_pay_amount Float?
+  created_at       DateTime    @default(now())
+  updated_at       DateTime    @updatedAt
+
+  job      Job           @relation(fields: [job_id], references: [id], onDelete: Cascade)
+  seeker   SeekerProfile @relation(fields: [seeker_id], references: [id], onDelete: Cascade)
+  clinic   ClinicProfile @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+  messages Message[]
+  reviews  Review[]      @relation("matchReview")
+
+  @@unique([job_id, seeker_id])
+  @@index([status])
+}
+
+// ==========================================
+// FAVORITE CLINICS
+// ==========================================
+
+model FavoriteClinic {
+  id         String   @id @default(uuid()) @db.Uuid
+  seeker_id  String   @db.Uuid
+  clinic_id  String   @db.Uuid
+  created_at DateTime @default(now())
+
+  clinic ClinicProfile @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+
+  @@unique([seeker_id, clinic_id])
+}
+
+// ==========================================
+// BOOKING SYSTEM
+// ==========================================
+
+model ClinicService {
+  id                String   @id @default(uuid()) @db.Uuid
+  clinic_id         String   @db.Uuid
+  name              String   // e.g. "อุดฟัน"
+  duration_minutes  Int      @default(30)
+  price             Float?
+  price_negotiable  Boolean  @default(false)
+  description       String?
+  is_active         Boolean  @default(true)
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  clinic   ClinicProfile @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@index([clinic_id, is_active])
+}
+
+model ClinicSchedule {
+  id                   String  @id @default(uuid()) @db.Uuid
+  clinic_id            String  @db.Uuid
+  provider_id          String? @db.Uuid
+  day_of_week          Int     // 0 = Sunday, 6 = Saturday
+  start_time           String  // "09:00"
+  end_time             String  // "17:00"
+  slot_duration_minutes Int    @default(30)
+  buffer_minutes       Int     @default(15)
+  is_active            Boolean @default(true)
+
+  clinic   ClinicProfile  @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+  provider SeekerProfile? @relation(fields: [provider_id], references: [id])
+
+  @@index([clinic_id, day_of_week])
+}
+
+model Booking {
+  id              String               @id @default(uuid()) @db.Uuid
+  clinic_id       String               @db.Uuid
+  provider_id     String?              @db.Uuid
+  patient_id      String               @db.Uuid
+  service_id      String?              @db.Uuid
+  booking_date    DateTime             @db.Date
+  start_time      String               // "09:00"
+  end_time        String               // "09:30"
+  status          BookingStatus        @default(PENDING)
+  patient_notes   String?
+  total_amount    Float?
+  payment_status  PaymentBookingStatus @default(UNPAID)
+  created_at      DateTime             @default(now())
+  updated_at      DateTime             @updatedAt
+
+  clinic   ClinicProfile  @relation("clinic", fields: [clinic_id], references: [id], onDelete: Cascade)
+  provider SeekerProfile? @relation("provider", fields: [provider_id], references: [id])
+  patient  Patient        @relation("patient", fields: [patient_id], references: [id], onDelete: Cascade)
+  service  ClinicService? @relation(fields: [service_id], references: [id])
+  payments Payment[]
+  messages Message[]
+  reviews  Review[]       @relation("bookingReview")
+
+  @@index([clinic_id, booking_date])
+  @@index([patient_id])
+  @@index([provider_id])
+  @@index([status])
+}
+
+// ==========================================
+// PAYMENT & ACCOUNTING
+// ==========================================
+
+model Payment {
+  id                String             @id @default(uuid()) @db.Uuid
+  booking_id        String?            @db.Uuid
+  clinic_id         String             @db.Uuid
+  patient_id        String             @db.Uuid
+  amount            Float
+  payment_method    PaymentMethod      @default(TRANSFER)
+  slip_image_url    String?            // encrypted path
+  ai_verified       Boolean            @default(false)
+  ai_extracted_data Json?              // { amount, date, bank, ref }
+  verified_by       VerifiedBy?
+  match_status      PaymentMatchStatus @default(PENDING_REVIEW)
+  status            PaymentStatus      @default(PENDING)
+  created_at        DateTime           @default(now())
+  updated_at        DateTime           @updatedAt
+
+  booking Booking?      @relation(fields: [booking_id], references: [id])
+  clinic  ClinicProfile @relation("paymentClinic", fields: [clinic_id], references: [id])
+  patient Patient       @relation("paymentPatient", fields: [patient_id], references: [id])
+
+  @@index([clinic_id, created_at])
+  @@index([status])
+}
+
+model AccountingSummary {
+  id              String   @id @default(uuid()) @db.Uuid
+  clinic_id       String   @db.Uuid
+  date            DateTime @db.Date
+  total_revenue   Float    @default(0)
+  total_bookings  Int      @default(0)
+  cash_amount     Float    @default(0)
+  transfer_amount Float    @default(0)
+  created_at      DateTime @default(now())
+
+  clinic ClinicProfile @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+
+  @@unique([clinic_id, date])
+}
+
+// ==========================================
+// WORK HISTORY & CERTIFICATES
+// ==========================================
+
+model WorkHistory {
+  id          String    @id @default(uuid()) @db.Uuid
+  provider_id String    @db.Uuid
+  clinic_id   String    @db.Uuid
+  start_date  DateTime  @db.Date
+  end_date    DateTime? @db.Date
+  role        String?
+  is_verified Boolean   @default(false)
+  created_at  DateTime  @default(now())
+
+  provider SeekerProfile @relation(fields: [provider_id], references: [id], onDelete: Cascade)
+  clinic   ClinicProfile @relation(fields: [clinic_id], references: [id], onDelete: Cascade)
+
+  @@index([provider_id])
+}
+
+model ProviderCertificate {
+  id          String   @id @default(uuid()) @db.Uuid
+  provider_id String   @db.Uuid
+  name        String
+  issuer      String?
+  issue_date  DateTime? @db.Date
+  image_url   String?
+  is_verified Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  provider SeekerProfile @relation(fields: [provider_id], references: [id], onDelete: Cascade)
+
+  @@index([provider_id])
+}
+
+// ==========================================
+// COMMUNICATION
+// ==========================================
+
+model Message {
+  id         String   @id @default(uuid()) @db.Uuid
+  match_id   String?  @db.Uuid
+  booking_id String?  @db.Uuid
+  sender_id  String   @db.Uuid
+  content    String
+  read_at    DateTime?
+  created_at DateTime @default(now())
+
+  match   Match?   @relation(fields: [match_id], references: [id], onDelete: Cascade)
+  booking Booking? @relation(fields: [booking_id], references: [id], onDelete: Cascade)
+  sender  User     @relation("sender", fields: [sender_id], references: [id], onDelete: Cascade)
+
+  @@index([match_id, created_at])
+  @@index([booking_id, created_at])
+  @@index([sender_id])
+}
+
+// ==========================================
+// REVIEWS
+// ==========================================
+
+model Review {
+  id          String   @id @default(uuid()) @db.Uuid
+  match_id    String?  @db.Uuid
+  booking_id  String?  @db.Uuid
+  reviewer_id String   @db.Uuid
+  reviewee_id String   @db.Uuid
+  rating      Int      // 1-5
+  comment     String?
+  reported    Boolean  @default(false)
+  created_at  DateTime @default(now())
+
+  match    Match?  @relation("matchReview", fields: [match_id], references: [id])
+  booking  Booking? @relation("bookingReview", fields: [booking_id], references: [id])
+  reviewer User    @relation("reviewer", fields: [reviewer_id], references: [id])
+  reviewee User    @relation("reviewee", fields: [reviewee_id], references: [id])
+
+  @@index([reviewee_id, rating])
+  @@index([reviewer_id])
+}
+
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
+
+model Notification {
+  id         String   @id @default(uuid()) @db.Uuid
+  user_id    String   @db.Uuid
+  title      String
+  body       String
+  type       String   // "match", "booking", "payment", "chat", "system"
+  data       Json?    // extra metadata
+  read_at    DateTime?
+  is_read    Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, is_read])
+  @@index([user_id, read_at])
+  @@index([created_at])
+}
+
+// ==========================================
+// OTP VERIFICATION
+// ==========================================
+
+model OtpCode {
+  id         String   @id @default(uuid()) @db.Uuid
+  user_id    String   @unique @db.Uuid
+  code_hash  String   // SHA-256 of the 6-digit code
+  expires_at DateTime
+  used       Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+}
+
+// ==========================================
+// SECURITY & AUDIT
+// ==========================================
+
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  user_id     String?  @db.Uuid
+  action      String   // "read", "create", "update", "delete"
+  resource    String   // "patient_data", "payment", etc.
+  resource_id String?
+  ip_address  String?
+  user_agent  String?
+  details     Json?
+  created_at  DateTime @default(now())
+
+  user User? @relation(fields: [user_id], references: [id])
+
+  @@index([user_id, created_at])
+  @@index([resource, action])
+}
+
+model Consent {
+  id           String    @id @default(uuid()) @db.Uuid
+  user_id      String    @db.Uuid
+  consent_type String    // "privacy_policy", "terms", "medical_data", "marketing"
+  granted      Boolean   @default(true)
+  granted_at   DateTime  @default(now())
+  revoked_at   DateTime?
+  ip_address   String?
+  version      String    // policy version
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, consent_type])
+}

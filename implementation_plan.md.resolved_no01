@@ -1,0 +1,836 @@
+# 🏥 MedMatch — Full Application Implementation Plan
+
+## Painpoint Analysis Summary
+
+จาก [project.md](file:///Users/beamm/Docseek/project.md) สรุป Painpoints หลักได้ดังนี้:
+
+| ฝ่าย | Painpoint | วิธีแก้ใน MedMatch |
+|---|---|---|
+| **บุคลากร** | หางานผ่าน FB/LINE — ข้อมูลไม่ real-time, ต้อง scroll, ทักไปแล้วได้คนแล้ว | Job Matching แบบ Tinder-style + Auto-expire + Location filter |
+| **คลินิก** | ตอบแชทซ้ำๆ, ลืมลบโพสต์, ไม่มีระบบ verify คุณสมบัติ | Applicant Management + Auto-close + License Verification |
+| **คนไข้** | ไม่มีข้อมูลเปรียบเทียบ, จองต้องโทร/แชท, ไม่มีระบบยืนยันชำระ | Public Profile + Online Booking + AI Slip Verification |
+
+---
+
+## 1. Infrastructure Recommendation
+
+### 🔥 Oracle Cloud Free Tier — แนะนำอย่างยิ่ง
+
+Oracle Cloud Infrastructure (OCI) Always Free tier เป็นตัวเลือกที่ดีมากสำหรับ startup — ให้ resource เยอะกว่า AWS/GCP/Azure Free tier อย่างมาก:
+
+| Resource | Oracle Always Free | AWS Free Tier | GCP Free Tier |
+|---|---|---|---|
+| **Compute** | 4 Ampere A1 OCPUs + 24 GB RAM (ตลอดชีพ) | t2.micro 1 vCPU 1GB (12 เดือน) | e2-micro 0.25 vCPU 1GB |
+| **Storage** | 200 GB Block Volume | 30 GB EBS (12 เดือน) | 30 GB Standard |
+| **Database** | 2x Autonomous DB (20 GB each) | ❌ | ❌ |
+| **Networking** | 10 TB/month outbound | 100 GB/month (12 เดือน) | 200 GB/month |
+| **Load Balancer** | 1 Flexible LB | ❌ | ❌ |
+
+> [!TIP]
+> **Oracle Always Free เหมาะมาก** — ได้ Ampere A1 (ARM) 4 cores + 24 GB RAM ซึ่งเพียงพอสำหรับ production workload ขนาดกลาง ฟรีตลอดชีพ ไม่จำกัดเวลา
+
+### Proposed Infrastructure Architecture
+
+```
+┌────────────────────────── Oracle Cloud (Always Free) ──────────────────────────┐
+│                                                                                 │
+│  ┌──── VM Instance 1 (2 OCPU, 12 GB) ────┐  ┌── VM Instance 2 (2 OCPU, 12 GB) ──┐
+│  │  🐳 Docker Compose                      │  │  🐳 Docker Compose                  │
+│  │  ├── NestJS API Server                  │  │  ├── Python AI Service (Slip OCR)   │
+│  │  ├── Redis (Cache + Queue)              │  │  ├── Nginx (Reverse Proxy + SSL)    │
+│  │  ├── Socket.IO (Real-time)              │  │  └── Monitoring (Grafana + Prometheus)│
+│  │  └── Next.js (Admin/Landing)            │  │                                      │
+│  └─────────────────────────────────────────┘  └──────────────────────────────────────┘
+│                                                                                 │
+│  ┌──── Oracle Autonomous Database (Always Free) ────┐                          │
+│  │  PostgreSQL-compatible (ATP)                       │                          │
+│  │  ├── 20 GB Storage                                │                          │
+│  │  ├── Auto-scaling, Auto-patching                  │                          │
+│  │  ├── TDE (Transparent Data Encryption)            │                          │
+│  │  └── Automatic Backups                            │                          │
+│  └────────────────────────────────────────────────────┘                          │
+│                                                                                 │
+│  ┌──── Oracle Object Storage (Always Free) ──────────┐                          │
+│  │  10 GB Standard + 10 GB Infrequent Access          │                          │
+│  │  ├── Profile Images                                │                          │
+│  │  ├── License Documents (Encrypted)                 │                          │
+│  │  └── Payment Slips (Encrypted)                     │                          │
+│  └────────────────────────────────────────────────────┘                          │
+│                                                                                 │
+│  ┌──── Networking (Always Free) ─────────────────────┐                          │
+│  │  ├── Flexible Load Balancer (1x)                   │                          │
+│  │  ├── VCN + Subnets + Security Lists               │                          │
+│  │  └── 10 TB/month Outbound Data                    │                          │
+│  └────────────────────────────────────────────────────┘                          │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+External Services (Free/Low-cost):
+├── Firebase Auth (Free tier: 10K SMS/month)
+├── Firebase Cloud Messaging (Free unlimited)
+├── Cloudflare (Free SSL + CDN + DDoS Protection)
+├── GitHub Actions (Free 2,000 min/month)
+├── Sentry (Free 5K events/month)
+└── Mapbox/Google Maps (see section below)
+```
+
+> [!IMPORTANT]
+> **เทียบกับ DigitalOcean ในแผนเดิม**: Oracle Free Tier ให้ resource มากกว่าหลายเท่า ฟรีตลอดชีพ ถ้าต้องการ scale เพิ่มก็เปลี่ยนเป็น Pay-As-You-Go ได้ง่าย ประหยัดต้นทุนช่วง startup อย่างมาก
+
+### Cost Comparison (Monthly)
+
+| Item | Oracle Free Tier | DigitalOcean (Original Plan) |
+|---|---|---|
+| Compute | **$0** (4 OCPU, 24 GB) | $48 (2x Droplets) |
+| Database | **$0** (Autonomous DB) | $15 (Managed Postgres) |
+| Object Storage | **$0** (20 GB) | $5 (Spaces) |
+| Load Balancer | **$0** (1 Flexible LB) | $12 |
+| **Total** | **$0/month** | **$80/month** |
+
+### เมื่อไหร่ควร Scale นอก Free Tier
+
+| Metric | Free Tier เพียงพอ | ต้อง Scale |
+|---|---|---|
+| Concurrent Users | < 500 | > 500 |
+| Database Size | < 20 GB | > 20 GB |
+| API Requests | < 10K/day | > 10K/day |
+| File Storage | < 20 GB | > 20 GB |
+
+---
+
+## 2. Security & Encryption Design (Bank-Grade)
+
+### Multi-Layer Security Architecture
+
+```
+┌──────────── Security Layers ────────────┐
+│                                          │
+│  Layer 1: Network Security              │
+│  ├── Cloudflare WAF + DDoS Protection   │
+│  ├── Oracle VCN Security Lists          │
+│  ├── TLS 1.3 Everywhere                 │
+│  └── IP Allowlisting for Admin          │
+│                                          │
+│  Layer 2: Application Security          │
+│  ├── JWT + Refresh Token (short-lived)  │
+│  ├── RBAC (Role-Based Access Control)   │
+│  ├── Rate Limiting (per IP + per User)  │
+│  ├── CORS + Helmet + CSRF Protection    │
+│  ├── Input Validation (class-validator) │
+│  └── SQL Injection Prevention (Prisma)  │
+│                                          │
+│  Layer 3: Data Encryption               │
+│  ├── TDE (Database-level)               │
+│  ├── AES-256-GCM (Column-level)         │
+│  ├── bcrypt (Passwords, saltRounds=12)  │
+│  └── Client-side E2E (Medical Records)  │
+│                                          │
+│  Layer 4: File Security                 │
+│  ├── Server-Side Encryption (SSE-S3)    │
+│  ├── Pre-signed URLs (time-limited)     │
+│  └── Virus Scan on Upload               │
+│                                          │
+│  Layer 5: Audit & Compliance            │
+│  ├── Audit Log (ทุก action ที่เกี่ยวกับข้อมูล) │
+│  ├── PDPA Consent Management            │
+│  └── Data Retention Policy              │
+└──────────────────────────────────────────┘
+```
+
+### Database Encryption Strategy
+
+```
+┌─── Encryption at Rest ───────────────────────────┐
+│                                                    │
+│  Tier 1: TDE (Transparent Data Encryption)        │
+│  → Oracle Autonomous DB มี TDE built-in           │
+│  → ทุก data file, redo log, backup ถูก encrypt    │
+│  → ใช้ AES-256 + TDE Master Key (HSM)             │
+│                                                    │
+│  Tier 2: Column-Level Encryption (AES-256-GCM)    │
+│  → สำหรับข้อมูลละเอียดอ่อนเป็นพิเศษ              │
+│  → encrypt ก่อนเขียน DB, decrypt ตอนอ่าน          │
+│  → Key ถูกจัดเก็บใน Oracle Vault / HashiCorp Vault│
+│                                                    │
+│  ข้อมูลที่ต้อง Column-Level Encrypt:               │
+│  ├── patients.drug_allergies                       │
+│  ├── patients.medical_notes                        │
+│  ├── seeker_profiles.license_number                │
+│  ├── payments.slip_image_url                       │
+│  ├── payments.ai_extracted_data                    │
+│  ├── users.phone (PII)                             │
+│  └── users.email (PII)                             │
+└────────────────────────────────────────────────────┘
+
+┌─── Encryption in Transit ────────────────────────┐
+│  ├── TLS 1.3 (API ↔ Client)                       │
+│  ├── mTLS (Service ↔ Service, ถ้าจำเป็น)          │
+│  ├── SSL (App ↔ Database)                          │
+│  └── WSS (WebSocket Secure for Chat)               │
+└────────────────────────────────────────────────────┘
+```
+
+### Key Management
+
+```typescript
+// ใช้ envelope encryption pattern
+// Master Key → ใน Oracle Vault / HashiCorp Vault
+// Data Encryption Key (DEK) → encrypt/decrypt data
+// DEK ถูก wrap ด้วย Master Key
+
+interface EncryptionService {
+  encrypt(plaintext: string): { ciphertext: string; iv: string; tag: string };
+  decrypt(ciphertext: string, iv: string, tag: string): string;
+  rotateKey(): Promise<void>; // Key rotation ทุก 90 วัน
+}
+```
+
+### PDPA Compliance Checklist
+
+- ✅ Consent Management — บันทึก consent ก่อนเก็บข้อมูลส่วนบุคคล
+- ✅ Data Access Log — บันทึกทุกครั้งที่มีการเข้าถึงข้อมูลสุขภาพ
+- ✅ Right to Delete — ลบข้อมูลได้ตาม request
+- ✅ Data Portability — export ข้อมูลเป็น JSON/CSV ได้
+- ✅ Breach Notification — แจ้งเตือนภายใน 72 ชม. หากมีการรั่วไหล
+- ✅ DPO (Data Protection Officer) — กำหนดผู้รับผิดชอบ
+
+---
+
+## 3. Map Integration Recommendation
+
+### Google Maps vs Mapbox Comparison
+
+| Feature | Google Maps | Mapbox |
+|---|---|---|
+| **Free Tier** | $200 credit/month (~28K map loads) | 50K map loads/month ฟรี |
+| **ราคาหลัง Free** | $7 / 1K loads | $5 / 1K loads |
+| **Geocoding** | $5 / 1K requests | $0.75 / 1K requests |
+| **Directions** | $5-10 / 1K requests | $0.50 / 1K requests |
+| **Map Style** | จำกัด customization | **Full customization** (Mapbox Studio) |
+| **Offline Maps** | ❌ (ต้องใช้ Premium) | ✅ ฟรี |
+| **React Native** | ใช้ react-native-maps | ใช้ @rnmapbox/maps |
+| **3D / Satellite** | ✅ ดี | ✅ ดีมาก (Globe view) |
+| **Thai Map Data** | ✅ ดีมาก (ข้อมูลครบ) | ⚠️ ดี แต่น้อยกว่า Google |
+| **Places API** | ✅ ครบสมบูรณ์ | ⚠️ ใช้ Geocoding แทน |
+
+> [!TIP]
+> ### 🏆 แนะนำ: **Mapbox** เป็นตัวเลือกหลัก + **Google Places API** เสริม
+> 
+> **เหตุผล:**
+> 1. **Free tier เยอะกว่า** — 50K loads vs 28K loads
+> 2. **ราคาหลัง free ถูกกว่ามาก** — โดยเฉพาะ Geocoding ถูกกว่า 6-7 เท่า
+> 3. **Customization สวยกว่า** — ปรับ style ได้ตาม branding ของ MedMatch
+> 4. **Offline maps ฟรี** — สำคัญสำหรับหมอที่ดู location ขณะเดินทาง
+> 5. ใช้ **Google Places API** เสริมเฉพาะสำหรับ Place Search (ค้นหาชื่อคลินิก/สถานที่)
+
+### Map Features ที่จะ Implement
+
+```
+┌─── Map Module Features ────────────────────────┐
+│                                                  │
+│  1. 📍 Job Map View (สำหรับหมอ)                 │
+│     ├── แสดงตำแหน่งงานบนแผนที่                   │
+│     ├── ปักหมุดตำแหน่งตัวเอง + เลือกรัศมี        │
+│     ├── Cluster markers เมื่อมีงานเยอะ           │
+│     ├── กดที่ marker → ดู popup ข้อมูลงาน        │
+│     └── Filter บนแผนที่ (สาขา, ค่าตอบแทน)       │
+│                                                  │
+│  2. 🏥 Clinic Map View (สำหรับคนไข้)             │
+│     ├── ค้นหาคลินิก/หมอ ใกล้เคียง                │
+│     ├── แสดง rating + ราคาบน marker              │
+│     ├── Navigate to clinic (เปิด Google Maps)     │
+│     └── Street View preview ก่อนไป                │
+│                                                  │
+│  3. 📍 Clinic Location Setup (สำหรับคลินิก)       │
+│     ├── ปักหมุดที่ตั้งคลินิก                      │
+│     ├── Pin location ด้วยตัวเอง (drag & drop)     │
+│     ├── หรือค้นหาชื่อสถานที่ (Places API)          │
+│     └── Preview สถานที่ (Street View / Satellite) │
+│                                                  │
+│  4. 🗺️ Clinic Preview (สำหรับทุกคน)              │
+│     ├── ดูสถานที่คลินิกก่อนไปจริง                 │
+│     ├── 360° Street View (ถ้ามี)                   │
+│     ├── Satellite View                            │
+│     ├── แสดงระยะทาง + เวลาเดินทาง                │
+│     └── ปุ่ม "นำทาง" → เปิด Google Maps/Apple Maps│
+│                                                  │
+│  5. 📊 Heat Map (Admin)                          │
+│     ├── แสดง demand ของแต่ละพื้นที่                │
+│     └── Supply vs Demand visualization            │
+└──────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Detailed Module Breakdown
+
+### 🅰️ Module A: Authentication & User Management
+
+#### Files & Components
+
+| File/Component | Functions | Description |
+|---|---|---|
+| `auth.module.ts` | - | Root auth module |
+| `auth.controller.ts` | `register()`, `login()`, `verifyOTP()`, `refreshToken()`, `logout()`, `forgotPassword()` | Auth endpoints |
+| `auth.service.ts` | `createUser()`, `validateOTP()`, `generateTokens()`, `revokeToken()`, `switchRole()` | Auth business logic |
+| `auth.guard.ts` | `canActivate()` | JWT + Role guard |
+| `firebase-auth.service.ts` | `sendOTP()`, `verifyOTP()`, `deleteUser()` | Firebase Auth integration |
+| `encryption.service.ts` | `encrypt()`, `decrypt()`, `hashPassword()`, `verifyPassword()`, `rotateKey()` | AES-256-GCM + bcrypt |
+| `audit-log.service.ts` | `logAccess()`, `logModification()`, `logDeletion()`, `getAuditTrail()` | PDPA audit logging |
+| `consent.service.ts` | `recordConsent()`, `revokeConsent()`, `getConsentStatus()`, `exportUserData()` | PDPA consent management |
+
+#### API Endpoints
+
+```
+POST   /auth/register          → สมัครสมาชิก (phone + OTP)
+POST   /auth/login             → เข้าสู่ระบบ
+POST   /auth/verify-otp        → ยืนยัน OTP
+POST   /auth/refresh           → Refresh access token
+POST   /auth/logout            → ออกจากระบบ (revoke token)
+POST   /auth/switch-role       → สลับ role (หมอ ↔ คนไข้)
+DELETE /auth/account            → ลบบัญชี (PDPA Right to Delete)
+GET    /auth/export-data        → Export ข้อมูลส่วนตัว (PDPA Portability)
+```
+
+---
+
+### 🅱️ Module B: Profile Management
+
+#### B1: Seeker Profile
+
+| File/Component | Functions |
+|---|---|
+| `seeker-profile.controller.ts` | `createProfile()`, `updateProfile()`, `getProfile()`, `getPublicProfile()`, `uploadProfileImage()`, `uploadLicense()` |
+| `seeker-profile.service.ts` | `create()`, `update()`, `findById()`, `findPublicById()`, `updateSpecialties()`, `getWorkHistory()`, `calculateRating()` |
+| `license-verification.service.ts` | `submitForVerification()`, `reviewLicense()`, `autoVerifyWithCouncil()`, `getVerificationStatus()` |
+
+```
+GET    /seekers/profile                → ดู profile ตัวเอง
+PUT    /seekers/profile                → แก้ไข profile
+GET    /seekers/:id/public             → ดู public profile (คนไข้เห็น)
+POST   /seekers/profile/image          → อัพรูป profile
+POST   /seekers/profile/license        → อัพใบประกอบวิชาชีพ
+GET    /seekers/:id/work-history       → ดูประวัติการทำงาน
+GET    /seekers/:id/reviews            → ดูรีวิว
+GET    /seekers/:id/certificates       → ดูใบ cert
+POST   /seekers/certificates           → เพิ่มใบ cert
+```
+
+#### B2: Clinic Profile
+
+| File/Component | Functions |
+|---|---|
+| `clinic-profile.controller.ts` | `createProfile()`, `updateProfile()`, `getProfile()`, `getPublicProfile()`, `uploadImages()`, `setLocation()` |
+| `clinic-profile.service.ts` | `create()`, `update()`, `findById()`, `findByArea()`, `updateEquipment()`, `updateBenefits()` |
+| `clinic-location.service.ts` | `setCoordinates()`, `geocodeAddress()`, `findNearby()`, `getDistanceTo()` |
+
+```
+GET    /clinics/profile                → ดู profile ตัวเอง
+PUT    /clinics/profile                → แก้ไข profile
+GET    /clinics/:id/public             → ดู public profile
+POST   /clinics/profile/images         → อัพรูปคลินิก
+PUT    /clinics/profile/location       → ตั้งค่า location (ปักหมุด)
+GET    /clinics/nearby                 → ค้นหาคลินิกใกล้เคียง (PostGIS)
+GET    /clinics/:id/reviews            → ดูรีวิวคลินิก
+GET    /clinics/:id/services           → ดูบริการที่เปิดรับ
+```
+
+#### B3: Patient Profile
+
+| File/Component | Functions |
+|---|---|
+| `patient-profile.controller.ts` | `createProfile()`, `updateProfile()`, `getProfile()`, `updateMedicalInfo()` |
+| `patient-profile.service.ts` | `create()`, `update()`, `findById()`, `updateAllergies()`, `updateMedicalNotes()` |
+
+```
+GET    /patients/profile               → ดู profile ตัวเอง
+PUT    /patients/profile               → แก้ไข profile
+PUT    /patients/medical-info          → อัพเดทข้อมูลทางการแพทย์ (encrypted)
+```
+
+---
+
+### 🅲️ Module C: Job Matching (Tinder-style)
+
+| File/Component | Functions |
+|---|---|
+| `job.controller.ts` | `createJob()`, `updateJob()`, `closeJob()`, `getMyJobs()`, `repostJob()` |
+| `job.service.ts` | `create()`, `update()`, `close()`, `autoExpire()`, `findOpenJobs()`, `getJobTemplates()` |
+| `job-matching.controller.ts` | `browseJobs()`, `swipeJob()`, `getMatches()`, `getApplicants()`, `acceptApplicant()`, `rejectApplicant()` |
+| `job-matching.service.ts` | `findMatchingJobs()`, `applyToJob()`, `acceptApplication()`, `rejectApplication()`, `createMatch()`, `calculateDistance()` |
+| `job-filter.service.ts` | `filterByLocation()`, `filterByDate()`, `filterBySpecialty()`, `filterByPay()`, `sortResults()` |
+| `job-map.service.ts` | `getJobsInRadius()`, `getJobsInBounds()`, `clusterJobs()`, `getHeatmapData()` |
+
+```
+# — Clinic (Job Poster) —
+POST   /jobs                           → สร้างงานใหม่
+PUT    /jobs/:id                       → แก้ไขงาน
+DELETE /jobs/:id                       → ลบงาน
+POST   /jobs/:id/close                 → ปิดงาน (ได้คนแล้ว)
+POST   /jobs/:id/repost               → Re-post จาก template
+GET    /jobs/my                        → ดูงานที่โพสต์ทั้งหมด
+GET    /jobs/:id/applicants            → ดูรายชื่อผู้สนใจ
+POST   /jobs/applicants/:id/accept     → Accept ผู้สนใจ
+POST   /jobs/applicants/:id/reject     → Reject ผู้สนใจ
+
+# — Seeker (Job Browser) —
+GET    /jobs/browse                    → ดูงานที่ match filter (card/list)
+GET    /jobs/browse/map                → ดูงานบนแผนที่
+POST   /jobs/:id/apply                 → กดสนใจ (swipe ขวา)
+POST   /jobs/:id/skip                  → ข้าม (swipe ซ้าย)
+GET    /jobs/matches                   → ดูงานที่ match แล้ว
+GET    /jobs/favorites                 → ดูคลินิกที่ favorite
+POST   /clinics/:id/favorite           → Favorite คลินิก
+```
+
+---
+
+### 🅳 Module D: Patient Booking
+
+| File/Component | Functions |
+|---|---|
+| `booking.controller.ts` | `createBooking()`, `getMyBookings()`, `cancelBooking()`, `getBookingDetail()` |
+| `booking.service.ts` | `create()`, `confirm()`, `cancel()`, `complete()`, `sendReminder()`, `findByPatient()`, `findByClinic()`, `findByProvider()` |
+| `schedule.controller.ts` | `setSchedule()`, `getSchedule()`, `getAvailableSlots()`, `blockSlot()` |
+| `schedule.service.ts` | `createSchedule()`, `updateSchedule()`, `getAvailableSlots()`, `isSlotAvailable()`, `calculateNextAvailable()` |
+| `clinic-service.controller.ts` | `createService()`, `updateService()`, `getServices()`, `toggleService()` |
+| `clinic-service.service.ts` | `create()`, `update()`, `findByClinic()`, `activate()`, `deactivate()` |
+
+```
+# — Patient —
+GET    /booking/search                 → ค้นหาคลินิก/หมอ (location, specialty, rating)
+GET    /booking/slots/:clinicId        → ดู slot ว่าง
+POST   /booking                        → จอง
+GET    /booking/my                     → ดูนัดหมายทั้งหมด
+PUT    /booking/:id/cancel             → ยกเลิกนัด
+GET    /booking/:id                    → ดูรายละเอียดนัด
+
+# — Clinic/Provider —
+GET    /schedule                       → ดูตาราง
+PUT    /schedule                       → ตั้งค่าตาราง
+POST   /schedule/block                 → บล็อก slot
+GET    /booking/clinic/today           → ดูนัดหมายวันนี้
+PUT    /booking/:id/confirm            → ยืนยันนัด
+PUT    /booking/:id/complete           → เสร็จสิ้นการรักษา
+PUT    /booking/:id/no-show            → คนไข้ไม่มา
+
+# — Clinic Services —
+POST   /clinic-services                → เพิ่มบริการ
+PUT    /clinic-services/:id            → แก้ไขบริการ
+GET    /clinic-services/:clinicId      → ดูบริการทั้งหมดของคลินิก
+```
+
+---
+
+### 🅴 Module E: Chat & Real-time Communication
+
+| File/Component | Functions |
+|---|---|
+| `chat.gateway.ts` | `handleConnection()`, `handleDisconnect()`, `handleMessage()`, `handleTyping()`, `handleRead()` |
+| `chat.controller.ts` | `getConversations()`, `getMessages()`, `sendMessage()` |
+| `chat.service.ts` | `createConversation()`, `sendMessage()`, `markAsRead()`, `getUnreadCount()`, `getConversationHistory()` |
+| `notification.service.ts` | `sendPush()`, `sendInApp()`, `sendEmail()`, `sendSMS()`, `getNotifications()`, `markAsRead()` |
+
+```
+# REST API
+GET    /chat/conversations             → ดูรายการแชท
+GET    /chat/:conversationId/messages  → ดูข้อความ
+POST   /chat/:conversationId/messages  → ส่งข้อความ
+
+# WebSocket Events
+socket.emit('join', { conversationId })
+socket.emit('message', { content, type })
+socket.emit('typing', { conversationId })
+socket.on('new-message', handler)
+socket.on('user-typing', handler)
+socket.on('message-read', handler)
+
+# Notifications
+GET    /notifications                  → ดู notifications
+PUT    /notifications/:id/read         → อ่านแล้ว
+PUT    /notifications/read-all         → อ่านทั้งหมดแล้ว
+```
+
+---
+
+### 🅵 Module F: Payment & Accounting
+
+| File/Component | Functions |
+|---|---|
+| `payment.controller.ts` | `uploadSlip()`, `getPaymentHistory()`, `getPaymentDetail()`, `verifySlipManually()` |
+| `payment.service.ts` | `createPayment()`, `processSlip()`, `matchPaymentToBooking()`, `getHistory()`, `generateQR()` |
+| `slip-verification.service.ts` | `analyzeSlip()`, `extractData()`, `matchAmount()`, `flagMismatch()` |
+| `accounting.controller.ts` | `getDashboard()`, `getDailyReport()`, `getMonthlyReport()`, `exportReport()` |
+| `accounting.service.ts` | `calculateDailyRevenue()`, `calculateMonthlyRevenue()`, `generateReport()`, `exportPDF()`, `exportExcel()` |
+| `telegram-bot.service.ts` | `handleSlipMessage()`, `sendConfirmation()`, `linkToBooking()` |
+
+```
+# — Payment —
+POST   /payments/slip                  → อัพสลิป
+GET    /payments/history               → ประวัติการชำระ
+GET    /payments/:id                   → รายละเอียดการชำระ
+POST   /payments/:id/verify            → ยืนยันสลิป (admin/manual)
+POST   /payments/qr                    → สร้าง QR PromptPay
+
+# — Accounting (Clinic only) —
+GET    /accounting/dashboard           → Dashboard ภาพรวม
+GET    /accounting/daily               → รายงานประจำวัน
+GET    /accounting/monthly             → รายงานประจำเดือน
+GET    /accounting/export/pdf          → Export PDF
+GET    /accounting/export/excel        → Export Excel
+GET    /accounting/by-service          → สรุปตามประเภทการรักษา
+```
+
+---
+
+### 🅶 Module G: Review & Rating
+
+| File/Component | Functions |
+|---|---|
+| `review.controller.ts` | `createReview()`, `getReviews()`, `getMyReviews()`, `reportReview()` |
+| `review.service.ts` | `create()`, `findByReviewee()`, `findByReviewer()`, `calculateAvgRating()`, `updateUserRating()`, `reportReview()`, `moderateReview()` |
+
+```
+POST   /reviews                        → เขียนรีวิว
+GET    /reviews/user/:id               → ดูรีวิวของ user
+GET    /reviews/my                     → ดูรีวิวที่เขียน
+POST   /reviews/:id/report             → แจ้งรีวิวไม่เหมาะสม
+```
+
+---
+
+### 🅷 Module H: Map & Location Services
+
+| File/Component | Functions |
+|---|---|
+| `map.controller.ts` | `searchPlaces()`, `geocode()`, `reverseGeocode()`, `getDirections()`, `getClinicPreview()` |
+| `map.service.ts` | `searchNearby()`, `calculateDistance()`, `getRouteInfo()`, `getStaticMapUrl()` |
+| `geospatial.service.ts` | `findWithinRadius()`, `findInBounds()`, `clusterPoints()`, `getHeatmapData()` |
+
+```
+GET    /map/search                     → ค้นหาสถานที่
+GET    /map/geocode                    → แปลงที่อยู่เป็นพิกัด
+GET    /map/reverse-geocode            → แปลงพิกัดเป็นที่อยู่
+GET    /map/directions                 → คำนวณเส้นทาง + เวลาเดินทาง
+GET    /map/clinic/:id/preview         → ดู preview สถานที่คลินิก
+GET    /map/jobs/heatmap               → Heat map ของ demand
+```
+
+---
+
+### 🅸 Module I: Admin Panel
+
+| File/Component | Functions |
+|---|---|
+| `admin.controller.ts` | `getDashboard()`, `getUsers()`, `updateUserStatus()`, `verifyLicense()`, `getReports()` |
+| `admin.service.ts` | `getStatistics()`, `manageUsers()`, `reviewLicenses()`, `handleDisputes()`, `generateSystemReport()` |
+
+```
+GET    /admin/dashboard                → Dashboard ภาพรวม
+GET    /admin/users                    → ดูรายชื่อ users
+PUT    /admin/users/:id/status         → เปลี่ยนสถานะ user
+GET    /admin/licenses/pending         → ใบประกอบรอตรวจ
+PUT    /admin/licenses/:id/verify      → Verify ใบประกอบ
+GET    /admin/reviews/reports          → รีวิวที่ถูกแจ้ง
+GET    /admin/analytics                → วิเคราะห์ข้อมูลระบบ
+```
+
+---
+
+## 5. Updated Tech Stack
+
+| Component | Technology | เหตุผล |
+|---|---|---|
+| **Mobile App** | React Native (Expo) | Cross-platform: iOS + Android + iPad |
+| **Web Admin** | Next.js 14 (App Router) | Admin panel + Landing page + SEO |
+| **API Server** | NestJS (Node.js) | Modular, TypeScript, ดี production |
+| **Database** | PostgreSQL + PostGIS (Oracle ATP) | Geolocation + Auto-managed + TDE |
+| **ORM** | Prisma | Type-safe, migration management |
+| **Real-time** | Socket.IO | Chat + live notifications |
+| **Auth** | Firebase Auth | OTP เบอร์โทรไทย |
+| **File Storage** | Oracle Object Storage | Encrypted, free 20 GB |
+| **Push Notification** | Firebase Cloud Messaging | Cross-platform push |
+| **Cache** | Redis (Docker บน OCI) | Session, cache, real-time queue |
+| **AI Service** | Python FastAPI | Slip OCR, AI recommendation |
+| **Map** | **Mapbox GL** + Google Places API | Free 50K loads + ถูกกว่า + Customizable |
+| **Hosting** | **Oracle Cloud (Always Free)** | ฟรีตลอดชีพ, resource เยอะ |
+| **CI/CD** | GitHub Actions | Automated deployment |
+| **Monitoring** | Sentry + Grafana + Prometheus | Error tracking + metrics |
+| **CDN/WAF** | Cloudflare | SSL + CDN + DDoS ฟรี |
+| **Secrets** | HashiCorp Vault / Oracle Vault | Key management + rotation |
+| **Container** | Docker + Docker Compose | Easy deployment + reproducible |
+
+---
+
+## 6. React Native (Expo) App Structure
+
+```
+medmatch-app/
+├── app/                          # Expo Router (file-based routing)
+│   ├── (auth)/                   # Auth screens
+│   │   ├── login.tsx             # Login + OTP
+│   │   ├── register.tsx          # สมัครสมาชิก
+│   │   ├── role-select.tsx       # เลือก role
+│   │   └── onboarding/           # Onboarding flow
+│   │
+│   ├── (seeker)/                 # หมอ/บุคลากร screens
+│   │   ├── home.tsx              # Swipe cards view
+│   │   ├── map.tsx               # Map view (Mapbox)
+│   │   ├── calendar.tsx          # ปฏิทินงาน
+│   │   ├── matches.tsx           # รายการ match
+│   │   ├── chat/                 # แชท
+│   │   │   ├── index.tsx         # รายการแชท
+│   │   │   └── [id].tsx          # ห้องแชท
+│   │   └── profile.tsx           # Profile ตัวเอง
+│   │
+│   ├── (clinic)/                 # คลินิก screens
+│   │   ├── dashboard.tsx         # Dashboard ภาพรวม
+│   │   ├── post-job.tsx          # โพสต์งาน
+│   │   ├── applicants/           # จัดการผู้สนใจ
+│   │   ├── bookings/             # จัดการนัดหมาย
+│   │   ├── payments/             # สลิป + การชำระ
+│   │   ├── accounting.tsx        # รายงานบัญชี
+│   │   └── profile.tsx           # Profile คลินิก
+│   │
+│   ├── (patient)/                # คนไข้ screens
+│   │   ├── search.tsx            # ค้นหาคลินิก/หมอ
+│   │   ├── clinic/[id].tsx       # Profile คลินิก
+│   │   ├── doctor/[id].tsx       # Profile หมอ
+│   │   ├── booking.tsx           # จอง
+│   │   ├── my-bookings.tsx       # นัดหมายของฉัน
+│   │   ├── payment.tsx           # ชำระเงิน
+│   │   └── reviews.tsx           # รีวิว
+│   │
+│   └── (common)/                 # Shared screens
+│       ├── map-preview.tsx       # Preview สถานที่ (Mapbox)
+│       ├── notifications.tsx     # Notifications
+│       └── settings.tsx          # ตั้งค่า
+│
+├── components/                   # Reusable components
+│   ├── ui/                       # Design system (Button, Input, Card, etc.)
+│   ├── map/                      # Map components (MapView, Marker, etc.)
+│   ├── job/                      # Job card, Job detail, etc.
+│   ├── booking/                  # Booking components
+│   └── chat/                     # Chat components
+│
+├── services/                     # API services
+│   ├── api.ts                    # Axios instance + interceptors
+│   ├── auth.service.ts           # Auth API calls
+│   ├── job.service.ts            # Job matching API
+│   ├── booking.service.ts        # Booking API
+│   ├── payment.service.ts        # Payment API
+│   ├── chat.service.ts           # Chat + Socket.IO
+│   ├── map.service.ts            # Map + Geocoding
+│   └── notification.service.ts   # Push notifications
+│
+├── stores/                       # State management (Zustand)
+│   ├── auth.store.ts
+│   ├── job.store.ts
+│   ├── booking.store.ts
+│   └── chat.store.ts
+│
+├── hooks/                        # Custom hooks
+├── utils/                        # Utilities
+│   ├── encryption.ts             # Client-side encryption
+│   ├── validators.ts             # Input validation
+│   └── formatters.ts             # Date, currency formatters
+│
+└── constants/                    # App constants + theme
+```
+
+---
+
+## 7. NestJS Backend Structure
+
+```
+medmatch-api/
+├── src/
+│   ├── main.ts                   # Entry point
+│   ├── app.module.ts             # Root module
+│   │
+│   ├── modules/
+│   │   ├── auth/                 # Module A: Authentication
+│   │   │   ├── auth.module.ts
+│   │   │   ├── auth.controller.ts
+│   │   │   ├── auth.service.ts
+│   │   │   ├── auth.guard.ts
+│   │   │   ├── strategies/       # JWT, Firebase strategies
+│   │   │   └── dto/              # RegisterDto, LoginDto, etc.
+│   │   │
+│   │   ├── profile/              # Module B: Profiles
+│   │   │   ├── seeker/
+│   │   │   ├── clinic/
+│   │   │   └── patient/
+│   │   │
+│   │   ├── job/                  # Module C: Job Matching
+│   │   │   ├── job.module.ts
+│   │   │   ├── job.controller.ts
+│   │   │   ├── job.service.ts
+│   │   │   ├── job-matching.service.ts
+│   │   │   ├── job-filter.service.ts
+│   │   │   └── job-map.service.ts
+│   │   │
+│   │   ├── booking/              # Module D: Booking
+│   │   │   ├── booking.module.ts
+│   │   │   ├── booking.controller.ts
+│   │   │   ├── booking.service.ts
+│   │   │   ├── schedule.service.ts
+│   │   │   └── clinic-service.service.ts
+│   │   │
+│   │   ├── chat/                 # Module E: Chat
+│   │   │   ├── chat.module.ts
+│   │   │   ├── chat.gateway.ts
+│   │   │   ├── chat.controller.ts
+│   │   │   └── chat.service.ts
+│   │   │
+│   │   ├── payment/              # Module F: Payment
+│   │   │   ├── payment.module.ts
+│   │   │   ├── payment.controller.ts
+│   │   │   ├── payment.service.ts
+│   │   │   ├── slip-verification.service.ts
+│   │   │   ├── accounting.controller.ts
+│   │   │   └── accounting.service.ts
+│   │   │
+│   │   ├── review/               # Module G: Review
+│   │   │   ├── review.module.ts
+│   │   │   ├── review.controller.ts
+│   │   │   └── review.service.ts
+│   │   │
+│   │   ├── map/                  # Module H: Map
+│   │   │   ├── map.module.ts
+│   │   │   ├── map.controller.ts
+│   │   │   ├── map.service.ts
+│   │   │   └── geospatial.service.ts
+│   │   │
+│   │   ├── notification/         # Notification Service
+│   │   │   ├── notification.module.ts
+│   │   │   └── notification.service.ts
+│   │   │
+│   │   └── admin/                # Module I: Admin
+│   │       ├── admin.module.ts
+│   │       ├── admin.controller.ts
+│   │       └── admin.service.ts
+│   │
+│   ├── common/                   # Shared (guards, pipes, etc.)
+│   │   ├── guards/
+│   │   ├── pipes/
+│   │   ├── interceptors/
+│   │   ├── decorators/
+│   │   └── filters/
+│   │
+│   ├── security/                 # Security layer
+│   │   ├── encryption.service.ts
+│   │   ├── audit-log.service.ts
+│   │   ├── consent.service.ts
+│   │   └── rate-limiter.ts
+│   │
+│   └── config/                   # Configuration
+│       ├── database.config.ts
+│       ├── redis.config.ts
+│       ├── firebase.config.ts
+│       ├── mapbox.config.ts
+│       └── encryption.config.ts
+│
+├── prisma/
+│   ├── schema.prisma             # Database schema
+│   └── migrations/               # Migration files
+│
+├── docker-compose.yml            # Docker setup
+├── Dockerfile                    # Multi-stage build
+└── .env.example                  # Environment variables template
+```
+
+---
+
+## 8. Database Encryption Implementation
+
+### Prisma Schema with Encrypted Fields
+
+```prisma
+model User {
+  id            String   @id @default(uuid())
+  phone_enc     Bytes    // AES-256-GCM encrypted
+  phone_hash    String   @unique // SHA-256 hash for lookup
+  email_enc     Bytes?   // AES-256-GCM encrypted
+  email_hash    String?  @unique
+  password_hash String   // bcrypt
+  role          UserRole
+  is_active     Boolean  @default(true)
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+}
+
+model Patient {
+  id              String  @id @default(uuid())
+  user_id         String  @unique
+  first_name_enc  Bytes   // encrypted
+  last_name_enc   Bytes   // encrypted
+  dob_enc         Bytes   // encrypted
+  allergies_enc   Bytes?  // encrypted (sensitive medical data)
+  medical_notes_enc Bytes? // encrypted (sensitive medical data)
+}
+```
+
+### Encryption Service (NestJS)
+
+```typescript
+// AES-256-GCM with key rotation support
+@Injectable()
+export class EncryptionService {
+  // 1. encrypt() — Encrypt plaintext with AES-256-GCM
+  // 2. decrypt() — Decrypt ciphertext
+  // 3. hashForLookup() — SHA-256 hash for DB lookups
+  // 4. hashPassword() — bcrypt with saltRounds=12
+  // 5. verifyPassword() — bcrypt compare
+  // 6. rotateEncryptionKey() — Re-encrypt all data with new key
+  // 7. generateDataKey() — Envelope encryption pattern
+}
+```
+
+---
+
+## 9. Verification Plan
+
+### Automated Tests
+
+```bash
+# Backend Unit Tests (NestJS + Jest)
+cd medmatch-api && npm run test
+
+# Backend E2E Tests
+cd medmatch-api && npm run test:e2e
+
+# Encryption Tests
+cd medmatch-api && npm run test -- --testPathPattern=encryption
+
+# Database Migration Test
+cd medmatch-api && npx prisma migrate deploy --preview-feature
+
+# Security Tests (OWASP ZAP scan)
+docker run -t owasp/zap2docker-stable zap-baseline.py -t https://api.medmatch.app
+```
+
+### Manual Verification
+
+1. **Auth Flow** — สมัครด้วย OTP → login → switch role → logout
+2. **Map Integration** — เปิดแผนที่ → ปักหมุด → ดู clinic preview → นำทาง  
+3. **Encryption** — ตรวจ DB โดยตรง → ข้อมูลต้องเป็น encrypted bytes ไม่ใช่ plaintext
+4. **Booking Flow** — ค้นหาคลินิก → เลือก slot → จอง → อัพสลิป → ยืนยัน
+5. **Job Matching** — โพสต์งาน → หมอเห็นงาน → swipe สนใจ → คลินิก accept → match
+
+> [!IMPORTANT]
+> เนื่องจากนี่เป็นแผนการออกแบบระดับ Full Application ยังไม่มี codebase ที่มีอยู่ จึงยังไม่มี test ที่สามารถรันได้ตอนนี้ — test commands ด้านบนจะใช้ได้หลังจากเริ่ม implement แล้ว กรุณาแจ้งว่าต้องการเริ่ม implement module ไหนก่อนครับ
+
+---
+
+## 10. Development Timeline (Revised)
+
+| Phase | Duration | Modules | Deliverable |
+|---|---|---|---|
+| **Phase 1** | เดือน 1-3 | Auth + Profile + Job Matching | MVP — Job Board + Chat |
+| **Phase 2** | เดือน 4-6 | Booking + Map + Review | Patient Booking + Map Preview |
+| **Phase 3** | เดือน 7-9 | Payment + Accounting + AI Slip | Payment System + Reports |
+| **Phase 4** | เดือน 10-12 | Admin + Subscription + Scale | Full Platform + Monetization |
+
+---
+
+*แผนนี้ออกแบบเพื่อรองรับการขยายตัวในอนาคต โดยใช้ Oracle Cloud Free Tier เป็น infrastructure หลัก ลดต้นทุนขณะที่ยังคงความปลอดภัยระดับธนาคาร*
